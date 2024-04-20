@@ -64,6 +64,7 @@
 
 #define USE_FAIL_COUNTER
 #define USE_RADARS
+//#define USE_NONBLOCK
 
 #include <TasmotaSerial.h>
 
@@ -146,6 +147,27 @@ struct TCLIENT {
 #ifdef USE_RADARS
   uint32_t radars[8] {{}};
 #endif
+#ifdef USE_NONBLOCK
+union 
+{
+  struct  {
+    uint8_t cmd_start;
+    struct  {
+      uint8_t command;
+      uint8_t parameter;
+      uint8_t unused2;
+      uint8_t unused3;
+    } Command;
+    uint8_t cmd_end;
+    uint8_t data_start;
+    char payload[1];
+  };
+  uint8_t data[250];
+} RxBuffer;
+uint8_t Expected{ 0u };
+uint8_t Received{ 0u };
+bool Started{ false };
+#endif //USE_NONBLOCK
 } TClient;
 
 typedef union {
@@ -207,30 +229,23 @@ TasmotaSerial *TasmotaClient_Serial;
 
 
 #ifdef USE_RADARS
-// --------------------------------------------------------------------------
-int stringToInt(const char* str)
-{
+int stringToInt(const char* str) {
   int result = 0;
-  for (int i = 0; str[i] != '\0'; ++i)
-  {
+  for (int i = 0; str[i] != '\0'; ++i) {
     result = result * 10 + (str[i] - '0');
   }
   return result;
 }
 
-void parseJSONAndFillArray(const char* data, uint32_t* radars)
-{
+void parseJSONAndFillArray(const char* data, uint32_t* radars) {
   char* json = strdup(data);
   const char* token = strtok(json, ",}");
-  while (token != NULL)
-  {
+  while (token != NULL) {
     // Extract index (x) from name (Rx)
     const char* name = strstr(token, "R");
-    if (name != NULL)
-    {
+    if (name != NULL) {
       int index = atoi(name + 1); // Index starts after char 'R'
-      if (index >= 0 && index < 8)
-      {
+      if (index >= 0 && index < 8) {
         // Extract and assign value
         const char* valueStr = strchr(token, ':') + 1;
         radars[index] = stringToInt(valueStr);
@@ -240,7 +255,6 @@ void parseJSONAndFillArray(const char* data, uint32_t* radars)
   }
   free(json);
 }
-// --------------------------------------------------------------------------
 #endif
 
 void TasmotaClient_Reset(void) {
@@ -273,10 +287,10 @@ uint8_t TasmotaClient_receiveData(char* buffer, int size) {
     int data = TasmotaClient_Serial->read();
     if (data >= 0) {
       if (PARAM_DATA_START == data) { index = 0; }  // Start of data
-      else if (PARAM_DATA_END == data) { break; }   // End of data
+      else if (PARAM_DATA_END == data) { return index; } //{ break; }   // End of data
       else if (index < 255) {
         buffer[index++] = (char)data;               // Data
-        if (index == size) { break; }               // No EoD received or done
+        if (index == size) { return index; } //{ break; }               // No EoD received or done
       }
     } else {
       delay(1);
@@ -285,9 +299,11 @@ uint8_t TasmotaClient_receiveData(char* buffer, int size) {
   }
   if (255 == index) { index = 0; }
 
+  AddLog(LOG_LEVEL_ERROR, PSTR("TCL: ReceiveTimeout! data: %*_H"), index, (uint8_t*)buffer);
+
 //  AddLog(LOG_LEVEL_DEBUG, PSTR("TCL: ReceiveData %*_H"), index, (uint8_t*)buffer);
 
-  return index;
+  return 0; // index;
 }
 
 uint8_t TasmotaClient_sendBytes(uint8_t* bytes, int count) {
@@ -430,6 +446,22 @@ uint32_t TasmotaClient_Flash(uint8_t* data, size_t size) {
   return error;                              // Error or Flash done!
 }
 
+void TasmotaClient_ApplyFeatures(const char* buffer, uint8_t len) {
+  if (len == sizeof(TClientSettings)) {
+    memcpy(&TClientSettings, &buffer, sizeof(TClientSettings));
+    if (TASMOTA_CLIENT_LIB_VERSION == TClientSettings.features_version) {
+      TClient.type = true;
+      AddLog(LOG_LEVEL_INFO, PSTR("TCL: Version: %u, json: %u, client_send: %u"), TClientSettings.features_version,
+        TClientSettings.features.func_json_append, TClientSettings.features.func_client_send);
+    } else {
+      if ((!TClient.unsupported) && (TClientSettings.features_version > 0)) {
+        AddLog(LOG_LEVEL_INFO, PSTR("TCL: Version %u not supported!"), TClientSettings.features_version);
+        TClient.unsupported = true;
+      }
+    }
+  }
+}
+
 void TasmotaClient_Init(void) {
   if (TClient.type) {
     return;
@@ -483,9 +515,12 @@ void TasmotaClient_Init(void) {
     }
   }
   if (TClient.SerialEnabled) {  // All go for hardware now we need to detect features if there are any
-    //AddLog(LOG_LEVEL_ERROR, PSTR("TCL: -- TasmotaClient_sendCmnd CMND_FEATURES"));
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCL: -- TasmotaClient_sendCmnd CMND_FEATURES"));
     TasmotaClient_sendCmnd(CMND_FEATURES, 0);
 
+#ifdef USE_NONBLOCK
+    TClient.Started = true;
+#else
     char buffer[sizeof(TClientSettings)];
     uint8_t len = TasmotaClient_receiveData(buffer, sizeof(buffer));  // 99 17 34 01 02 00 00 00
 #ifdef USE_FAIL_COUNTER
@@ -495,19 +530,8 @@ void TasmotaClient_Init(void) {
     }
     else TClient.failcount = 0;
 #endif
-    if (len == sizeof(TClientSettings)) {
-      memcpy(&TClientSettings, &buffer, sizeof(TClientSettings));
-      if (TASMOTA_CLIENT_LIB_VERSION == TClientSettings.features_version) {
-        TClient.type = true;
-        AddLog(LOG_LEVEL_INFO, PSTR("TCL: Version: %u, json: %u, client_send: %u"), TClientSettings.features_version,
-          TClientSettings.features.func_json_append, TClientSettings.features.func_client_send);
-      } else {
-        if ((!TClient.unsupported) && (TClientSettings.features_version > 0)) {
-          AddLog(LOG_LEVEL_INFO, PSTR("TCL: Version %u not supported!"), TClientSettings.features_version);
-          TClient.unsupported = true;
-        }
-      }
-    }
+    TasmotaClient_ApplyFeatures(buffer, len);
+#endif // USE_NONBLOCK    
   }
 }
 
@@ -515,18 +539,23 @@ bool TasmotaClient_Available(void) {
   return TClient.SerialEnabled;
 }
 
+void TasmotaClient_ApplyJson(const char* buffer, uint8_t len) {
+  if (len == 0) return;
+  ResponseAppend_P(PSTR(",\"TasmotaClient\":%s"), buffer);
+#ifdef USE_RADARS
+  parseJSONAndFillArray(buffer, TClient.radars);
+#endif
+}
+
 void TasmotaClient_Show(void) {
   if ((TClient.type) && (TClientSettings.features.func_json_append)) {
     TasmotaClient_sendCmnd(CMND_GET_JSON, 0);
-
+#ifndef USE_NONBLOCK
     char buffer[250];  // Keep size below 255 to stay within 8-bits index and len
     uint8_t len = TasmotaClient_receiveData(buffer, sizeof(buffer) -1);
-    if (len == 0) return;
     buffer[len] = '\0';
-    ResponseAppend_P(PSTR(",\"TasmotaClient\":%s"), buffer);
-#ifdef USE_RADARS
-    parseJSONAndFillArray(buffer, TClient.radars);
-#endif
+    TasmotaClient_ApplyJson(buffer, len);
+#endif // USE_NONBLOCK
   }
 }
 
@@ -579,7 +608,66 @@ void CmndClientSend(void) {
   }
 }
 
+#ifdef USE_NONBLOCK
+void TasmotaClient_ProcessCommand() {
+  switch (TClient.RxBuffer.Command.command) {
+    case CMND_FEATURES:
+      TasmotaClient_ApplyFeatures(TClient.RxBuffer.payload, TClient.RxBuffer.Command.parameter);
+      break;
+    case CMND_GET_JSON:
+      TClient.RxBuffer.payload[TClient.RxBuffer.Command.parameter] = '\0';
+      TasmotaClient_ApplyJson(TClient.RxBuffer.payload, TClient.RxBuffer.Command.parameter);
+      break;
+    case CMND_CLIENT_SEND:
+      break;
+    default:
+      break;
+  }
+}
+#endif // USE_NONBLOCK
+
 void TasmotaClient_ProcessIn(void) {
+#ifdef USE_NONBLOCK
+  do {
+    uint8_t b = TasmotaClient_Serial->read();
+    TClient.RxBuffer.data[TClient.Received] = b;
+    TClient.Received++;
+    if (TClient.Received == sizeof(TClient.RxBuffer.data)) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCL: ReceiveBuffer overflow! data: %*_H"), sizeof(TClient.RxBuffer.data), TClient.RxBuffer.data);
+      memset(TClient.RxBuffer.data, 0, sizeof(TClient.RxBuffer.data));
+      break;
+    }
+    if (0 == TClient.Expected) {// Receive Command
+      if (CMND_START == b) {
+        TClient.Expected = sizeof(TClient.RxBuffer.Command) + 2;
+        TClient.RxBuffer.Command.command = 0u;
+      }
+      else {
+        TClient.Received = 0u;
+      }
+    }
+    else if (TClient.Received >= TClient.Expected) {
+      if (CMND_END == b) {
+        if (0u < TClient.RxBuffer.Command.parameter) {
+          TClient.Expected += TClient.RxBuffer.Command.parameter + 2;
+        }
+      }
+      else if (PARAM_DATA_START == b) {
+        TClient.RxBuffer.data[TClient.Received - 1] = 0u; // terminate data by '\0'
+      }
+      else { //invalid format
+        TClient.RxBuffer.Command.command = 0u;
+      }
+
+      if (TClient.Received >= TClient.Expected) {
+        TasmotaClient_ProcessCommand();
+        TClient.Expected = 0u;
+        TClient.Received = 0u;
+      }
+    }
+    yield();
+  } while (TasmotaClient_Serial->available());
+#else // USE_NONBLOCK
   uint8_t cmnd = TasmotaClient_Serial->read();
   if (CMND_START == cmnd) {
     TasmotaClient_waitForSerialData(sizeof(TClientCommand), 50);
@@ -608,12 +696,12 @@ void TasmotaClient_ProcessIn(void) {
       ExecuteCommand(inbuf, SRC_TCL);
     }
   }
+#endif // USE_NONBLOCK
 }
 
 #ifdef USE_RADARS
 void TasmotaClient_WebSensor(void) {
-  for (int i = 0; i < 8; i++)
-  {
+  for (int i = 0; i < 8; i++) {
     WSContentSend_PD(PSTR("{s}" "Radar %d:" "{m}%u{e}"), i, TClient.radars[i]);
   }
 }
@@ -636,6 +724,11 @@ bool Xdrv31(uint32_t function) {
           TasmotaClient_sendCmnd(CMND_FUNC_EVERY_100_MSECOND, 0);
         }
       }
+#ifdef USE_NONBLOCK
+      else if (TClient.Started && TasmotaClient_Serial->available()) {
+        TasmotaClient_ProcessIn();
+      }
+#endif // USE_NONBLOCK      
       break;
     case FUNC_EVERY_SECOND:
       if ((TClient.type) && (TClientSettings.features.func_every_second)) {
