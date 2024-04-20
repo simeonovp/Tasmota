@@ -62,6 +62,9 @@
 #define PARAM_DATA_START                0xFE
 #define PARAM_DATA_END                  0xFF
 
+#define USE_FAIL_COUNTER
+#define USE_RADARS
+
 #include <TasmotaSerial.h>
 
 struct SimpleHexParse {
@@ -137,6 +140,12 @@ struct TCLIENT {
   bool SerialEnabled = false;
   uint8_t waitstate = 0;            // We use this so that features detection does not slow down other stuff on startup
   bool unsupported = false;
+#ifdef USE_FAIL_COUNTER
+  uint8_t failcount = 0;
+#endif
+#ifdef USE_RADARS
+  uint32_t radars[8] {{}};
+#endif
 } TClient;
 
 typedef union {
@@ -195,6 +204,44 @@ struct TCLIENT_COMMAND {
 } TClientCommand;
 
 TasmotaSerial *TasmotaClient_Serial;
+
+
+#ifdef USE_RADARS
+// --------------------------------------------------------------------------
+int stringToInt(const char* str)
+{
+  int result = 0;
+  for (int i = 0; str[i] != '\0'; ++i)
+  {
+    result = result * 10 + (str[i] - '0');
+  }
+  return result;
+}
+
+void parseJSONAndFillArray(const char* data, uint32_t* radars)
+{
+  char* json = strdup(data);
+  const char* token = strtok(json, ",}");
+  while (token != NULL)
+  {
+    // Extract index (x) from name (Rx)
+    const char* name = strstr(token, "R");
+    if (name != NULL)
+    {
+      int index = atoi(name + 1); // Index starts after char 'R'
+      if (index >= 0 && index < 8)
+      {
+        // Extract and assign value
+        const char* valueStr = strchr(token, ':') + 1;
+        radars[index] = stringToInt(valueStr);
+      }
+    }
+    token = strtok(NULL, ",}");
+  }
+  free(json);
+}
+// --------------------------------------------------------------------------
+#endif
 
 void TasmotaClient_Reset(void) {
   if (TClient.SerialEnabled) {
@@ -387,6 +434,16 @@ void TasmotaClient_Init(void) {
   if (TClient.type) {
     return;
   }
+#ifdef USE_FAIL_COUNTER
+  if (TClient.failcount >= 10) {
+    if (TClient.failcount == 10) 
+    {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCL: TasmotaClient_receiveData len: 0 of %u"), sizeof(TClientSettings));
+      TClient.failcount++;
+    }
+    return;
+  }
+#endif
   if (10 > TClient.waitstate) {
     TClient.waitstate++;
     return;
@@ -409,20 +466,41 @@ void TasmotaClient_Init(void) {
         pinMode(Pin(GPIO_TASMOTACLIENT_RST), OUTPUT);
         TClient.SerialEnabled = true;
         TasmotaClient_Reset();
-        AddLog(LOG_LEVEL_INFO, PSTR("TCL: Enabled"));
+        AddLog(LOG_LEVEL_INFO, PSTR("TCL: Enabled, speed: %u"), USE_TASMOTA_CLIENT_SERIAL_SPEED);
       }
+      else  
+      {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCL: Serial begin failed"));
+      }
+    }
+    else  
+    {
+      if (!PinUsed(GPIO_TASMOTACLIENT_RXD)) AddLog(LOG_LEVEL_ERROR, PSTR("TCL: Serial pin RXD not configured"));
+      if (!PinUsed(GPIO_TASMOTACLIENT_TXD)) AddLog(LOG_LEVEL_ERROR, PSTR("TCL: Serial pin TXD not configured"));
+      if (!PinUsed(GPIO_TASMOTACLIENT_RST) && !PinUsed(GPIO_TASMOTACLIENT_RST_INV)) AddLog(LOG_LEVEL_ERROR, PSTR("TCL: Serial pin RST not configured"));
+
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCL: Serial pins not configured"));
     }
   }
   if (TClient.SerialEnabled) {  // All go for hardware now we need to detect features if there are any
+    //AddLog(LOG_LEVEL_ERROR, PSTR("TCL: -- TasmotaClient_sendCmnd CMND_FEATURES"));
     TasmotaClient_sendCmnd(CMND_FEATURES, 0);
 
     char buffer[sizeof(TClientSettings)];
     uint8_t len = TasmotaClient_receiveData(buffer, sizeof(buffer));  // 99 17 34 01 02 00 00 00
+#ifdef USE_FAIL_COUNTER
+    if (0 == len)
+    {
+      TClient.failcount++;
+    }
+    else TClient.failcount = 0;
+#endif
     if (len == sizeof(TClientSettings)) {
       memcpy(&TClientSettings, &buffer, sizeof(TClientSettings));
       if (TASMOTA_CLIENT_LIB_VERSION == TClientSettings.features_version) {
         TClient.type = true;
-        AddLog(LOG_LEVEL_INFO, PSTR("TCL: Version %u"), TClientSettings.features_version);
+        AddLog(LOG_LEVEL_INFO, PSTR("TCL: Version: %u, json: %u, client_send: %u"), TClientSettings.features_version,
+          TClientSettings.features.func_json_append, TClientSettings.features.func_client_send);
       } else {
         if ((!TClient.unsupported) && (TClientSettings.features_version > 0)) {
           AddLog(LOG_LEVEL_INFO, PSTR("TCL: Version %u not supported!"), TClientSettings.features_version);
@@ -443,9 +521,12 @@ void TasmotaClient_Show(void) {
 
     char buffer[250];  // Keep size below 255 to stay within 8-bits index and len
     uint8_t len = TasmotaClient_receiveData(buffer, sizeof(buffer) -1);
-
+    if (len == 0) return;
     buffer[len] = '\0';
     ResponseAppend_P(PSTR(",\"TasmotaClient\":%s"), buffer);
+#ifdef USE_RADARS
+    parseJSONAndFillArray(buffer, TClient.radars);
+#endif
   }
 }
 
@@ -486,6 +567,8 @@ void CmndClientSend(void) {
   if (TClient.SerialEnabled) {
     if (0 < XdrvMailbox.data_len) {
       TasmotaClient_sendCmnd(CMND_CLIENT_SEND, XdrvMailbox.data_len);
+      // AddLog(LOG_LEVEL_DEBUG, PSTR("TCL: SendData %*_H"), XdrvMailbox.data_len, (uint8_t*)XdrvMailbox.data);
+
       TasmotaClient_Serial->write(char(PARAM_DATA_START));
       for (uint32_t idx = 0; idx < XdrvMailbox.data_len; idx++) {
         TasmotaClient_Serial->write(XdrvMailbox.data[idx]);
@@ -527,6 +610,15 @@ void TasmotaClient_ProcessIn(void) {
   }
 }
 
+#ifdef USE_RADARS
+void TasmotaClient_WebSensor(void) {
+  for (int i = 0; i < 8; i++)
+  {
+    WSContentSend_PD(PSTR("{s}" "Radar %d:" "{m}%u{e}"), i, TClient.radars[i]);
+  }
+}
+#endif
+
 /*********************************************************************************************\
  * Interface
 \*********************************************************************************************/
@@ -556,6 +648,14 @@ bool Xdrv31(uint32_t function) {
         TasmotaClient_Show();
       }
       break;
+#ifdef USE_RADARS
+#ifdef USE_WEBSERVER
+    case FUNC_WEB_SENSOR:
+      TasmotaClient_WebSensor();
+      break;
+#endif // USE_WEBSERVER
+#endif // USE_RADARS
+
     case FUNC_COMMAND:
       result = DecodeCommand(kTasmotaClientCommands, TasmotaClientCommand);
       break;
