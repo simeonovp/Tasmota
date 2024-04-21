@@ -543,12 +543,21 @@ bool TasmotaClient_Available(void) {
   return TClient.SerialEnabled;
 }
 
+void TasmotaClient_SendSensors() {
+  ResponseClear();
+  ResponseAppendTime();
+  ResponseAppend_P(PSTR(",\"TasmotaClient\":%s"), TClient.json);
+  ResponseJsonEnd();
+  MqttPublishTeleSensor();
+}
+
 void TasmotaClient_ApplyJson(const char* buffer, uint8_t len) {
   if (len == 0) return;
   memcpy(TClient.json, buffer, len);
 #ifdef USE_RADARS
   parseJSONAndFillArray(buffer, TClient.radars);
 #endif
+  TasmotaClient_SendSensors();
 }
 
 void TasmotaClient_Show(void) {
@@ -671,7 +680,7 @@ void TasmotaClient_ProcessIn(void) {
       else if (PARAM_DATA_END == b) {
       }
       else { //invalid format
-        TClient.RxBuffer.Command.command = 0u;
+        //TClient.RxBuffer.Command.command = 0u;
       }
 
       if (TClient.Received >= TClient.Expected) {
